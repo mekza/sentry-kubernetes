@@ -1,25 +1,20 @@
 from kubernetes import client, config, watch
 from kubernetes.client.rest import ApiException
-from raven import breadcrumbs
-from raven import Client as SentryClient
-from raven.transport.threaded_requests import ThreadedRequestsHTTPTransport
 from urllib3.exceptions import ProtocolError
 
 import argparse
 import logging
 import os
 import time
+import sentry_sdk
 
 
-SDK_VALUE = {"name": "sentry-kubernetes", "version": "1.0.0"}
+SDK_VALUE = {"name": "sentry-kubernetes", "version": "2.0.0"}
 
 # mapping from k8s event types to event levels
 LEVEL_MAPPING = {"normal": "info"}
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "error")
-DSN = os.environ.get("DSN")
-ENV = os.environ.get("ENVIRONMENT")
-RELEASE = os.environ.get("RELEASE")
 CLUSTER_NAME = os.environ.get("CLUSTER_NAME")
 
 
@@ -49,57 +44,13 @@ EVENT_NAMESPACES = _listify_env("EVENT_NAMESPACES", DEPRECATED_EVENT_NAMESPACE)
 EVENT_NAMESPACES_EXCLUDED = _listify_env("EVENT_NAMESPACES_EXCLUDED")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--log-level", default=LOG_LEVEL)
-    args = parser.parse_args()
-
-    log_level = args.log_level.upper()
-    logging.basicConfig(format="%(asctime)s %(message)s", level=log_level)
-    logging.debug("log_level: %s" % log_level)
-
-    try:
-        config.load_incluster_config()
-    except:
-        config.load_kube_config()
-
-    while True:
-        try:
-            watch_loop()
-        except ApiException as e:
-            logging.error(
-                "Exception when calling CoreV1Api->list_event_for_all_namespaces: %s\n"
-                % e
-            )
-            time.sleep(5)
-        except ProtocolError:
-            logging.warning("ProtocolError exception. Continuing...")
-        except Exception as e:
-            logging.exception("Unhandled exception occurred.")
-
-
 def watch_loop():
     logging.info("Starting Kubernetes watcher")
     v1 = client.CoreV1Api()
     w = watch.Watch()
-
-    logging.info("Initializing Sentry client")
-    sentry = SentryClient(
-        dsn=DSN,
-        install_sys_hook=False,
-        install_logging_hook=False,
-        include_versions=False,
-        capture_locals=False,
-        context={},
-        environment=ENV,
-        release=RELEASE,
-        transport=ThreadedRequestsHTTPTransport,
+    sentry_sdk.init(
+        debug=True if logging.root.level == logging.DEBUG else False,
     )
-
-    # try:
-    #     resource_version = v1.list_event_for_all_namespaces().items[-1].metadata.resource_version
-    # except:
-    #     resource_version = 0
 
     if EVENT_NAMESPACES and len(EVENT_NAMESPACES) == 1:
         stream = w.stream(v1.list_namespaced_event, EVENT_NAMESPACES[0])
@@ -114,12 +65,10 @@ def watch_loop():
 
         meta = {k: v for k, v in event.metadata.to_dict().items() if v is not None}
 
-        creation_timestamp = meta.pop("creation_timestamp", None)
-
         level = event.type and event.type.lower()
         level = LEVEL_MAPPING.get(level, level)
 
-        component = source_host = reason = namespace = name = short_name = kind = None
+        component = reason = namespace = name = short_name = kind = None
         if event.source:
             source = event.source.to_dict()
 
@@ -127,8 +76,6 @@ def watch_loop():
                 component = source["component"]
                 if COMPONENTS_EXCLUDED and component in COMPONENTS_EXCLUDED:
                     continue
-            if "host" in source:
-                source_host = source["host"]
 
         if event.reason:
             reason = event.reason
@@ -143,7 +90,11 @@ def watch_loop():
         if namespace and EVENT_NAMESPACES and namespace not in EVENT_NAMESPACES:
             continue
 
-        if namespace and EVENT_NAMESPACES_EXCLUDED and namespace in EVENT_NAMESPACES_EXCLUDED:
+        if (
+            namespace
+            and EVENT_NAMESPACES_EXCLUDED
+            and namespace in EVENT_NAMESPACES_EXCLUDED
+        ):
             continue
 
         if event.involved_object and event.involved_object.kind:
@@ -175,63 +126,56 @@ def watch_loop():
                     if v is not None
                 }
 
-            fingerprint = []
-            tags = {}
-
             if CLUSTER_NAME:
-                tags["cluster"] = CLUSTER_NAME
+                sentry_sdk.set_tag("cluster", CLUSTER_NAME)
 
             if component:
-                tags["component"] = component
+                sentry_sdk.set_tag("component", component)
 
             if reason:
-                tags["reason"] = event.reason
-                fingerprint.append(event.reason)
+                sentry_sdk.set_tag("reason", event.reason)
 
             if namespace:
-                tags["namespace"] = namespace
-                fingerprint.append(namespace)
+                sentry_sdk.set_tag("namespace", namespace)
 
             if short_name:
-                tags["name"] = short_name
-                fingerprint.append(short_name)
+                sentry_sdk.set_tag("short_name", short_name)
 
             if kind:
-                tags["kind"] = kind
-                fingerprint.append(kind)
+                sentry_sdk.set_tag("kind", kind)
 
-            data = {
-                "sdk": SDK_VALUE,
-                "server_name": source_host or "n/a",
-                "culprit": "%s %s" % (obj_name, reason),
-            }
+            if obj_name:
+                sentry_sdk.set_tag("culprit", obj_name)
 
-            logging.debug("Sending event to Sentry:\n{}".format(data))
+            sentry_sdk.set_context("sentry-kubernetes SDK", SDK_VALUE)
 
-            sentry.captureMessage(
-                message,
-                # culprit=culprit,
-                data=data,
-                date=creation_timestamp,
-                extra=meta,
-                fingerprint=fingerprint,
-                level=level,
-                tags=tags,
-            )
-
-        data = {}
-        if name:
-            data["name"] = name
-        if namespace:
-            data["namespace"] = namespace
-
-        breadcrumbs.record(
-            data=data,
-            level=level,
-            message=message,
-            timestamp=time.mktime(creation_timestamp.timetuple()),
-        )
+            with sentry_sdk.push_scope() as scope:
+                scope.fingerprint = [event.reason, short_name, kind, namespace]
+                sentry_sdk.capture_message(message, level)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log-level", default=LOG_LEVEL)
+    args = parser.parse_args()
+
+    log_level = args.log_level.upper()
+    logging.basicConfig(format="%(asctime)s %(message)s", level=log_level)
+    logging.debug("log_level: %s" % log_level)
+
+    try:
+        config.load_incluster_config()
+    except:  # noqa: E722
+        config.load_kube_config()
+
+    while True:
+        try:
+            watch_loop()
+        except ApiException as e:
+            logging.error(
+                "Exception when calling CoreV1Api->list_event_for_all_namespaces: %s\n"
+                % e
+            )
+            time.sleep(5)
+        except ProtocolError:
+            logging.warning("ProtocolError exception. Continuing...")
